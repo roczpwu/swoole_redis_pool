@@ -1,0 +1,13 @@
+// $Id$
+// vim:ft=javascript
+
+// If your extension references something external, use ARG_WITH
+// ARG_WITH("redis_coro", "for redis_coro support", "no");
+
+// Otherwise, use ARG_ENABLE
+// ARG_ENABLE("redis_coro", "enable redis_coro support", "no");
+
+if (PHP_REDIS_CORO != "no") {
+	EXTENSION("redis_coro", "redis_coro.c", PHP_EXTNAME_SHARED, "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+}
+
