@@ -241,15 +241,15 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
         redis_request *next_request = get_waiting_request(redis_coro_ptr);
         if (next_request != NULL) {
             // 队列有等待的请求，直接用来处理下一个请求
-            (*(redis_coro_ptr->m_fd_request))[fd] = request;
-            int ret = cli->send(cli, request->tx_buffer, sdslen(request->tx_buffer), 0);
+            (*(redis_coro_ptr->m_fd_request))[fd] = next_request;
+            int ret = cli->send(cli, next_request->tx_buffer, sdslen(next_request->tx_buffer), 0);
         } else {
             redis_coro_ptr->m_busy_connection->erase(fd);
             (*(redis_coro_ptr->m_idle_connection))[fd] = connection;
             while (redis_coro_ptr->m_idle_connection->size()
                 + redis_coro_ptr->m_busy_connection->size()
                 + redis_coro_ptr->m_invalid_connection->size()
-                > redis_coro_ptr->max_active 
+                > redis_coro_ptr->pool_size 
             && redis_coro_ptr->m_idle_connection->size() > 0) {
                 std::map<int,redis_connection*>::iterator it = redis_coro_ptr->m_idle_connection->begin();
                 close_redis_connection(it->second);
@@ -512,7 +512,7 @@ PHP_METHOD(redis_coro, __construct)
     redis_coro_ptr->ip         = swString_dup(ip, ip_len);
     redis_coro_ptr->port       = (int)port;
     redis_coro_ptr->timeout    = (int)timeout;
-    redis_coro_ptr->pool_size  = 5; 
+    redis_coro_ptr->pool_size  = 10; 
     redis_coro_ptr->max_active = 10; 
     redis_coro_ptr->password = password == NULL ? swString_dup("", 0) : swString_dup(password, password_len);
     redis_coro_ptr->m_busy_connection    = new std::map<int, redis_connection*>();
@@ -550,9 +550,30 @@ PHP_METHOD(redis_coro, __destruct)
     delete(redis_coro_ptr->m_busy_connection);
     delete(redis_coro_ptr->m_idle_connection);
     delete(redis_coro_ptr->m_invalid_connection);
-    //TODO: 清除任务列表，释放内部资源
+    // 清除任务列表，释放内部资源
+    while(redis_coro_ptr->q_waiting_request->size() > 0) {
+        redis_request *request = redis_coro_ptr->q_waiting_request->back();
+        redis_coro_ptr->q_waiting_request->pop_back();
+        free_redis_request(request);
+    }
     delete(redis_coro_ptr->q_waiting_request);
     delete(redis_coro_ptr->m_fd_request);
+}
+
+PHP_METHOD(redis_coro, setPool)
+{
+    long pool_size, max_active = 0;
+    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"l|l", &pool_size, &max_active) == FAILURE) {
+        RETURN_FALSE;
+    }
+    if (pool_size < 1)
+        pool_size = 10;
+    if (max_active < pool_size)
+        max_active = pool_size;
+    zval *object = getThis();
+    redis_coro_object *redis_coro_ptr = GET_REDIS_OBJECT_P(Z_OBJ_P(object));
+    redis_coro_ptr->pool_size = pool_size;
+    redis_coro_ptr->max_active = max_active;
 }
 
 PHP_METHOD(redis_coro, execute)
@@ -615,6 +636,7 @@ PHP_METHOD(redis_coro, execute_pipeline)
 static zend_function_entry redis_class_methods[] = {
     PHP_ME(redis_coro, __construct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
     PHP_ME(redis_coro, __destruct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+    PHP_ME(redis_coro, setPool, NULL, ZEND_ACC_PUBLIC)
     PHP_ME(redis_coro, execute, NULL, ZEND_ACC_PUBLIC)
     PHP_ME(redis_coro, execute_pipeline, NULL, ZEND_ACC_PUBLIC)
     {NULL,NULL,NULL}
@@ -651,50 +673,50 @@ PHP_MINIT_FUNCTION(redis_coro)
     redis_object_handlers.free_obj = redis_free_storage;
     redis_object_handlers.dtor_obj = redis_destroy_storage;
     redis_object_handlers.offset = XtOffsetOf(redis_coro_object, std);
-	return SUCCESS;
+    return SUCCESS;
 }
 
 PHP_MSHUTDOWN_FUNCTION(redis_coro)
 {
-	return SUCCESS;
+    return SUCCESS;
 }
 
 PHP_RINIT_FUNCTION(redis_coro)
 {
 #if defined(COMPILE_DL_REDIS_CORO) && defined(ZTS)
-	ZEND_TSRMLS_CACHE_UPDATE();
+    ZEND_TSRMLS_CACHE_UPDATE();
 #endif
-	return SUCCESS;
+    return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(redis_coro)
 {
-	return SUCCESS;
+    return SUCCESS;
 }
 
 PHP_MINFO_FUNCTION(redis_coro)
 {
-	php_info_print_table_start();
-	php_info_print_table_header(2, "redis_coro support", "enabled");
-	php_info_print_table_end();
+    php_info_print_table_start();
+    php_info_print_table_header(2, "redis_coro support", "enabled");
+    php_info_print_table_end();
 }
 
 const zend_function_entry redis_coro_functions[] = {
     PHP_FE(redis_coro_test, NULL)
-	PHP_FE_END	/* Must be the last line in redis_coro_functions[] */
+    PHP_FE_END  /* Must be the last line in redis_coro_functions[] */
 };
 
 zend_module_entry redis_coro_module_entry = {
-	STANDARD_MODULE_HEADER,
-	"redis_coro",
-	redis_coro_functions,
-	PHP_MINIT(redis_coro),
-	PHP_MSHUTDOWN(redis_coro),
-	PHP_RINIT(redis_coro),		/* Replace with NULL if there's nothing to do at request start */
-	PHP_RSHUTDOWN(redis_coro),	/* Replace with NULL if there's nothing to do at request end */
-	PHP_MINFO(redis_coro),
-	PHP_REDIS_CORO_VERSION,
-	STANDARD_MODULE_PROPERTIES
+    STANDARD_MODULE_HEADER,
+    "redis_coro",
+    redis_coro_functions,
+    PHP_MINIT(redis_coro),
+    PHP_MSHUTDOWN(redis_coro),
+    PHP_RINIT(redis_coro),      /* Replace with NULL if there's nothing to do at request start */
+    PHP_RSHUTDOWN(redis_coro),  /* Replace with NULL if there's nothing to do at request end */
+    PHP_MINFO(redis_coro),
+    PHP_REDIS_CORO_VERSION,
+    STANDARD_MODULE_PROPERTIES
 };
 
 #ifdef COMPILE_DL_REDIS_CORO
