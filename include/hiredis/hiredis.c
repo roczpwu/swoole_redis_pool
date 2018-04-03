@@ -207,6 +207,147 @@ static size_t bulklen(size_t len) {
     return 1+countDigits(len)+2+len+2;
 }
 
+int redisFormatCommandArgvv(char **target, const char *format, void** argv) {
+    int index = 0;
+    const char *c = format;
+    char *cmd = NULL; /* final command */
+    int pos; /* position in final command */
+    sds curarg, newarg; /* current argument */
+    int touched = 0; /* was the current argument touched? */
+    char **curargv = NULL, **newargv = NULL;
+    int argc = 0;
+    int totlen = 0;
+    int error_type = 0; /* 0 = no error; -1 = memory error; -2 = format error */
+    int j;
+
+    /* Abort if there is not target to set */
+    if (target == NULL)
+        return -1;
+
+    /* Build the command string accordingly to protocol */
+    curarg = sdsempty();
+    if (curarg == NULL)
+        return -1;
+
+    while(*c != '\0') {
+        if (*c != '%' || c[1] == '\0') {
+            if (*c == ' ') {
+                if (touched) {
+                    newargv = realloc(curargv,sizeof(char*)*(argc+1));
+                    if (newargv == NULL) goto memory_err;
+                    curargv = newargv;
+                    curargv[argc++] = curarg;
+                    totlen += bulklen(sdslen(curarg));
+
+                    /* curarg is put in argv so it can be overwritten. */
+                    curarg = sdsempty();
+                    if (curarg == NULL) goto memory_err;
+                    touched = 0;
+                }
+            } else {
+                newarg = sdscatlen(curarg,c,1);
+                if (newarg == NULL) goto memory_err;
+                curarg = newarg;
+                touched = 1;
+            }
+        } else {
+            char *arg;
+            size_t size;
+
+            /* Set newarg so it can be checked even if it is not touched. */
+            newarg = curarg;
+
+            switch(c[1]) {
+                case 's':
+                    arg = (char*)argv[index++];
+                    size = strlen(arg);
+                    if (size > 0)
+                        newarg = sdscatlen(curarg,arg,size);
+                    break;
+                case 'b':
+                    arg = (char*)argv[index++];
+                    size = (size_t)argv[index++];
+                    if (size > 0)
+                        newarg = sdscatlen(curarg,arg,size);
+                    break;
+                case '%':
+                    newarg = sdscat(curarg,"%");
+                    break;
+                default:
+                    break;
+            }
+
+            if (newarg == NULL) goto memory_err;
+            curarg = newarg;
+
+            touched = 1;
+            c++;
+        }
+        c++;
+    }
+
+    /* Add the last argument if needed */
+    if (touched) {
+        newargv = realloc(curargv,sizeof(char*)*(argc+1));
+        if (newargv == NULL) goto memory_err;
+        curargv = newargv;
+        curargv[argc++] = curarg;
+        totlen += bulklen(sdslen(curarg));
+    } else {
+        sdsfree(curarg);
+    }
+
+    /* Clear curarg because it was put in curargv or was free'd. */
+    curarg = NULL;
+
+    /* Add bytes needed to hold multi bulk count */
+    totlen += 1+countDigits(argc)+2;
+
+    /* Build the command at protocol level */
+    cmd = malloc(totlen+1);
+    if (cmd == NULL) goto memory_err;
+
+    pos = sprintf(cmd,"*%d\r\n",argc);
+    for (j = 0; j < argc; j++) {
+        pos += sprintf(cmd+pos,"$%zu\r\n",sdslen(curargv[j]));
+        memcpy(cmd+pos,curargv[j],sdslen(curargv[j]));
+        pos += sdslen(curargv[j]);
+        sdsfree(curargv[j]);
+        cmd[pos++] = '\r';
+        cmd[pos++] = '\n';
+    }
+    assert(pos == totlen);
+    cmd[pos] = '\0';
+
+    free(curargv);
+    *target = cmd;
+    return totlen;
+
+    format_err:
+    error_type = -2;
+    goto cleanup;
+
+    memory_err:
+    error_type = -1;
+    goto cleanup;
+
+    cleanup:
+    if (curargv) {
+        while(argc--)
+            sdsfree(curargv[argc]);
+        free(curargv);
+    }
+
+    sdsfree(curarg);
+
+    /* No need to check cmd since it is the last statement that can fail,
+     * but do it anyway to be as defensive as possible. */
+    if (cmd != NULL)
+        free(cmd);
+
+    return error_type;
+}
+
 int redisvFormatCommand(char **target, const char *format, va_list ap) {
     const char *c = format;
     char *cmd = NULL; /* final command */

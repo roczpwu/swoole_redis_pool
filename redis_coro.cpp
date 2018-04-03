@@ -78,7 +78,7 @@ struct redis_connection {
     } while(0)
 
 struct redis_request {
-    bool is_batch;
+    int type;       // 1:execute   2:pipeline    3:multi
     int size;
     bool is_timeout;
     sds tx_buffer;
@@ -205,6 +205,8 @@ redis_request* get_waiting_request(redis_coro_object *redis_coro_ptr) {
 
 void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
     //printf("on receive data fd %d\n", cli->socket->fd);
+    //printf("on receive data length %d\n", length);
+    int check_length = 0;
     redis_coro_object *redis_coro_ptr = (redis_coro_object*)cli->object;
     int fd = cli->socket->fd;
     redis_request *request = (*(redis_coro_ptr->m_fd_request))[fd];
@@ -212,13 +214,13 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
         request->rx_buffer = sdsempty();
     }
     request->rx_buffer = sdscatlen(request->rx_buffer,data,length);
+    int size = request->size;
+    bool complete = true;
     redisReader *reader = NULL;
     void *reply = NULL;
     reader = redisReaderCreate();
     int ret = redisReaderFeed(reader, request->rx_buffer, sdslen(request->rx_buffer)+1);
-    int size = request->size;
-    bool complete = true;
-    for (int i = 0; i < size; ++i) {
+    for (int i = 0; i < size && length > check_length; ++i) {
         if (ret != 0) {
             complete = false;
             break;
@@ -231,7 +233,6 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
         freeReplyObject(reply);
         reply = NULL;
     }
-    reader->pos = 0;
     if (complete) { //收到完整的数据包
         // 释放请求资源和连接
         swTimer_del(&SwooleG.timer, request->timeout_node);
@@ -256,6 +257,11 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
                 redis_coro_ptr->m_idle_connection->erase(it);
             }
         }
+        if (length > check_length) {
+            redisReaderFree(reader);
+            reader = redisReaderCreate();
+            redisReaderFeed(reader, request->rx_buffer, sdslen(request->rx_buffer)+1);
+        }
         if (!request->is_timeout) {
             // 未超时，把数据返回php
             php_context *context = request->context;
@@ -264,7 +270,15 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
             zdata = &_zdata;
             array_init(zdata);
             add_assoc_long(zdata, "ret", 0);
-            if (request->is_batch) {
+            if (request->type == 1) {
+                void *reply = NULL;
+                redisReaderGetReply(reader, &reply);
+                zval z_result;
+                array_init(&z_result);
+                resolve_from_reply((redisReply*)reply, &z_result);
+                add_assoc_zval(zdata, "result", &z_result);
+                freeReplyObject(reply);
+            } else if (request->type == 2) {
                 zval z_results;
                 array_init(&z_results);
                 add_assoc_zval(zdata, "results", &z_results);
@@ -277,14 +291,48 @@ void redis_onReceiveData(swClient *cli, char *data, uint32_t length) {
                     add_next_index_zval(&z_results, &z_result);
                     freeReplyObject(reply);
                 }
-            } else {
+            } else if (request->type == 3) {
+                //TODO: multi
+                zval z_results;
+                array_init(&z_results);
+                //add_assoc_zval(zdata, "results", &z_results);
                 void *reply = NULL;
                 redisReaderGetReply(reader, &reply);
-                zval z_result;
-                array_init(&z_result);
-                resolve_from_reply((redisReply*)reply, &z_result);
-                add_assoc_zval(zdata, "result", &z_result);
                 freeReplyObject(reply);
+                bool has_error = false;
+                for (int i = 0; i < request->size-1; i++) {
+                    void *reply = NULL;
+                    redisReaderGetReply(reader, &reply);
+                    redisReply *r = (redisReply*)reply;
+                    if (i < request->size-2) {
+                        if (r->type == 6) {
+                            zval z_result;
+                            array_init(&z_result);
+                            add_assoc_long(&z_result, "type", 6);
+                            add_assoc_long(&z_result, "index", i);
+                            add_assoc_stringl(&z_result, "msg", r->str, r->len);
+                            add_next_index_zval(&z_results, &z_result);
+                            has_error = true;
+                        }
+                    } else {
+                        if (has_error) {
+                            goto free_muti_reply;
+                        }
+                        for (int i = 0; i < r->elements; ++i) {
+                            redisReply *sub_reply = r->element[i];
+                            zval z_result;
+                            array_init(&z_result);
+                            resolve_from_reply((redisReply*)sub_reply, &z_result);
+                            add_next_index_zval(&z_results, &z_result);
+                        }
+                    }
+                    free_muti_reply:
+                    freeReplyObject(reply);
+                }
+                if (has_error)
+                    add_assoc_zval(zdata, "errors", &z_results);
+                else
+                    add_assoc_zval(zdata, "results", &z_results);
             }
             free_redis_request(request);
             redisReaderFree(reader);
@@ -421,18 +469,29 @@ void redis_onError(swClient *cli) {
     free(cli);
 }
 
-php_context* send_command(redis_coro_object *redis_coro_ptr, char** commands, int size, bool batch, int& code) {
+php_context* send_command(redis_coro_object *redis_coro_ptr, char** commands, void*** commands_argv, int size, int type, int& code) {
     code = 0;
     sds command_sds = sdsempty();
     for (int i = 0; i < size; i++) {
         char* cmdBuf = NULL;
-        redisFormatCommand(&cmdBuf, commands[i]);
+        void** command_argv = NULL;
+        if (commands_argv != NULL)
+            command_argv = commands_argv[i];
+        //printf("%s\n", commands[i]);
+        redisFormatCommandArgvv(&cmdBuf, commands[i], command_argv);
         command_sds = sdscatlen(command_sds,cmdBuf,strlen(cmdBuf));
         free(cmdBuf);
     }
     delete(commands);
+    if (commands_argv != NULL) {
+        for (int i = 0; i < size; ++i) {
+            if (commands_argv[i] != NULL)
+                delete(commands_argv[i]);
+        }
+        delete(commands_argv);
+    }
     redis_request *request  = (redis_request *)malloc(sizeof(redis_request));
-    request->is_batch       = batch;
+    request->type           = type;
     request->size           = size;
     request->is_timeout     = false;
     request->tx_buffer      = command_sds;
@@ -580,15 +639,24 @@ PHP_METHOD(redis_coro, execute)
 {
     char *command;
     long command_len;
-    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"s", &command, &command_len) == FAILURE) {
+    zval *z_argv = NULL;
+    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"s|a", &command, &command_len, &z_argv) == FAILURE) {
         RETURN_FALSE;
     }
     zval *object = getThis();
     redis_coro_object *redis_coro_ptr = GET_REDIS_OBJECT_P(Z_OBJ_P(object));
     char** commands = new char*[1];
     commands[0] = command;
+    HashTable *ht_argv = z_argv==NULL?NULL:Z_ARRVAL_P(z_argv);
+    int argv_c = ht_argv==NULL?0:zend_hash_num_elements(ht_argv);
+    char*** argv = new char**[1];
+    argv[0] = new char*[argv_c];
+    for (int i = 0; i < argv_c; i++) {
+        argv[0][i] = Z_STRVAL_P(zend_hash_get_current_data(ht_argv));
+        zend_hash_move_forward(ht_argv);
+    }
     int code = 0;
-    php_context *context = send_command(redis_coro_ptr, commands, 1, false, code);
+    php_context *context = send_command(redis_coro_ptr, commands, (void***)argv,1, 1, code);
     if (code != 0) {
         array_init(return_value);
         add_assoc_long(return_value, "ret", code);
@@ -600,30 +668,122 @@ PHP_METHOD(redis_coro, execute)
 
 PHP_METHOD(redis_coro, execute_pipeline)
 {
-    zval *z_value;
-    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"a", &z_value) == FAILURE) {
+    zval *z_commands;
+    zval *z_commands_argv = NULL;
+    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"a|a", &z_commands, &z_commands_argv) == FAILURE) {
         RETURN_FALSE;
     }
     zval *object = getThis();
     redis_coro_object *redis_coro_ptr = GET_REDIS_OBJECT_P(Z_OBJ_P(object));
-    if (Z_TYPE_P(z_value) != IS_ARRAY)
+    if (Z_TYPE_P(z_commands) != IS_ARRAY)
         RETURN_FALSE;
-    HashTable *ht = Z_ARRVAL_P(z_value);
-    int batch_count = zend_hash_num_elements(ht);
-    zend_hash_internal_pointer_reset(ht);
+    HashTable *ht_commands = Z_ARRVAL_P(z_commands);
+    int batch_count = zend_hash_num_elements(ht_commands);
+    zend_hash_internal_pointer_reset(ht_commands);
     char** commands = new char*[batch_count];
-    zval *item_val;
+    HashTable *ht_commands_argv = z_commands_argv==NULL?NULL:Z_ARRVAL_P(z_commands_argv);
+    int commands_argc = ht_commands_argv==NULL?0:zend_hash_num_elements(ht_commands_argv);
+    char*** commands_argv = commands_argc==0?NULL:new char**[batch_count];
     for (int i = 0; i < batch_count; i++) {
-        item_val = zend_hash_get_current_data(ht);
-        if (Z_TYPE_P(item_val) == IS_STRING) {
-            commands[i] = Z_STRVAL_P(item_val);
+        zval *z_command = zend_hash_get_current_data(ht_commands);
+        if (Z_TYPE_P(z_command) == IS_STRING) {
+            commands[i] = Z_STRVAL_P(z_command);
         } else {
             RETURN_FALSE;
         }
-        zend_hash_move_forward(ht);
+        zend_hash_move_forward(ht_commands);
+        if (commands_argv == NULL)
+            continue;
+        if (i<commands_argc) {
+            zval *z_command_argv = zend_hash_get_current_data(ht_commands_argv);
+            if (Z_TYPE_P(z_command_argv) == IS_NULL) {
+                commands_argv[i]=NULL;
+                continue;
+            } else if (Z_TYPE_P(z_command_argv) == IS_ARRAY) {
+                HashTable *ht_command_argv = Z_ARRVAL_P(z_command_argv);
+                int command_argc = zend_hash_num_elements(ht_command_argv);
+                commands_argv[i]=new char*[command_argc];
+                for (int j = 0; j < command_argc; j++) {
+                    commands_argv[i][j] = Z_STRVAL_P(zend_hash_get_current_data(ht_command_argv));
+                    zend_hash_move_forward(ht_command_argv);
+                }
+            } else {
+                RETURN_FALSE;
+            }
+        } else {
+            commands_argv[i]=NULL;
+        }
+        zend_hash_move_forward(ht_commands_argv);
     }
     int code = 0;
-    php_context *context = send_command(redis_coro_ptr, commands, batch_count, true, code);
+    php_context *context = send_command(redis_coro_ptr, commands, (void***)commands_argv, batch_count, 2, code);
+    if (code != 0) {
+        array_init(return_value);
+        add_assoc_long(return_value, "ret", code);
+        return;
+    }
+    coro_save(context);
+    coro_yield();
+}
+
+PHP_METHOD(redis_coro, execute_multi)
+{
+    zval *z_commands;
+    zval *z_commands_argv = NULL;
+    if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,"a|a", &z_commands, &z_commands_argv) == FAILURE) {
+        RETURN_FALSE;
+    }
+    zval *object = getThis();
+    redis_coro_object *redis_coro_ptr = GET_REDIS_OBJECT_P(Z_OBJ_P(object));
+    if (Z_TYPE_P(z_commands) != IS_ARRAY)
+        RETURN_FALSE;
+    HashTable *ht_commands = Z_ARRVAL_P(z_commands);
+    int batch_count = zend_hash_num_elements(ht_commands);
+    zend_hash_internal_pointer_reset(ht_commands);
+    char** commands = new char*[batch_count+2];
+
+    HashTable *ht_commands_argv = z_commands_argv==NULL?NULL:Z_ARRVAL_P(z_commands_argv);
+    int commands_argc = ht_commands_argv==NULL?0:zend_hash_num_elements(ht_commands_argv);
+    char*** commands_argv = commands_argc==0?NULL:new char**[batch_count+2];
+    commands[0]             = (char*)"MULTI";
+    commands[batch_count+1] = (char*)"EXEC";
+    if (commands_argv != NULL) {
+        commands_argv[0]                = NULL;
+        commands_argv[batch_count+1]    = NULL;
+    }
+    for (int i = 0; i < batch_count; i++) {
+        zval *z_command = zend_hash_get_current_data(ht_commands);
+        if (Z_TYPE_P(z_command) == IS_STRING) {
+            commands[i+1] = Z_STRVAL_P(z_command);
+        } else {
+            RETURN_FALSE;
+        }
+        zend_hash_move_forward(ht_commands);
+        if (commands_argv == NULL)
+            continue;
+        if (i<commands_argc) {
+            zval *z_command_argv = zend_hash_get_current_data(ht_commands_argv);
+            if (Z_TYPE_P(z_command_argv) == IS_NULL) {
+                commands_argv[i+1]=NULL;
+                continue;
+            } else if (Z_TYPE_P(z_command_argv) == IS_ARRAY) {
+                HashTable *ht_command_argv = Z_ARRVAL_P(z_command_argv);
+                int command_argc = zend_hash_num_elements(ht_command_argv);
+                commands_argv[i+1]=new char*[command_argc];
+                for (int j = 0; j < command_argc; j++) {
+                    commands_argv[i+1][j] = Z_STRVAL_P(zend_hash_get_current_data(ht_command_argv));
+                    zend_hash_move_forward(ht_command_argv);
+                }
+            } else {
+                RETURN_FALSE;
+            }
+        } else {
+            commands_argv[i+1]=NULL;
+        }
+        zend_hash_move_forward(ht_commands_argv);
+    }
+    int code = 0;
+    php_context *context = send_command(redis_coro_ptr, commands, (void***)commands_argv, batch_count+2, 3, code);
     if (code != 0) {
         array_init(return_value);
         add_assoc_long(return_value, "ret", code);
@@ -639,6 +799,7 @@ static zend_function_entry redis_class_methods[] = {
     PHP_ME(redis_coro, setPool, NULL, ZEND_ACC_PUBLIC)
     PHP_ME(redis_coro, execute, NULL, ZEND_ACC_PUBLIC)
     PHP_ME(redis_coro, execute_pipeline, NULL, ZEND_ACC_PUBLIC)
+    PHP_ME(redis_coro, execute_multi, NULL, ZEND_ACC_PUBLIC)
     {NULL,NULL,NULL}
 };
 
