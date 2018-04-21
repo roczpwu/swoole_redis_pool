@@ -117,30 +117,29 @@ struct redis_coro_object {
 zend_class_entry *redis_class_entry;
 static zend_object_handlers redis_object_handlers;
 
-//-------------------------------------------------------------------------------------
-void test_coro_onTimeout(swTimer *timer, swTimer_node *tnode) {
-    php_context *context = (php_context *)tnode->data;
-    zval *zdata, *retval = NULL;
-    zval _zdata;
-    zdata = &_zdata;
-    array_init(zdata);
-    add_assoc_long(zdata, "ret", -30001);
-    int ret = coro_resume(context, zdata, &retval);
-    if (ret == CORO_END && ret) {
-        zval_ptr_dtor(retval);
+void itoa(char *ch, long i) {
+    std::vector<int> v;
+    bool is_positive = i >= 0;
+    i = is_positive ? i : -i;
+    while(i > 0) {
+        v.push_back(i%10);
+        i/=10;
     }
-    zval_ptr_dtor(zdata);
-    efree(context);
+    if (v.empty())
+        v.push_back(0);
+    int index = 0;
+    if (!is_positive)
+        ch[index++] = '-';
+    while(!v.empty()) {
+        ch[index++] = v.back()+'0';
+        v.pop_back();
+    }
+    ch[index++] = '\0';
 }
 
+//-------------------------------------------------------------------------------------
 PHP_FUNCTION(redis_coro_test)
 {
-    php_swoole_check_reactor();
-    php_context *context = (php_context *)emalloc(sizeof(php_context));
-    php_swoole_check_timer(2);
-    SwooleG.timer.add(&SwooleG.timer, 2*1000, 0, context, test_coro_onTimeout);
-    coro_save(context);
-    coro_yield();
 }
 //-------------------------------------------------------------------------------------
 
@@ -652,7 +651,15 @@ PHP_METHOD(redis_coro, execute)
     char*** argv = new char**[1];
     argv[0] = new char*[argv_c];
     for (int i = 0; i < argv_c; i++) {
-        argv[0][i] = Z_STRVAL_P(zend_hash_get_current_data(ht_argv));
+        zval *z_argv_item = zend_hash_get_current_data(ht_argv);
+        if (Z_TYPE_P(z_argv_item) == IS_STRING) {
+            argv[0][i] = Z_STRVAL_P(z_argv_item);
+        }
+        else {
+            char ch_int[32];
+            itoa(ch_int, Z_LVAL_P(z_argv_item));
+            argv[0][i] = ch_int;
+        }
         zend_hash_move_forward(ht_argv);
     }
     int code = 0;
@@ -704,7 +711,14 @@ PHP_METHOD(redis_coro, execute_pipeline)
                 int command_argc = zend_hash_num_elements(ht_command_argv);
                 commands_argv[i]=new char*[command_argc];
                 for (int j = 0; j < command_argc; j++) {
-                    commands_argv[i][j] = Z_STRVAL_P(zend_hash_get_current_data(ht_command_argv));
+                    zval *z_argv_item = zend_hash_get_current_data(ht_command_argv);
+                    if (Z_TYPE_P(z_argv_item) == IS_STRING) {
+                        commands_argv[i][j] = Z_STRVAL_P(z_argv_item);
+                    } else {
+                        char ch_int[32];
+                        itoa(ch_int, Z_LVAL_P(z_argv_item));
+                        commands_argv[i][j] = ch_int;
+                    }
                     zend_hash_move_forward(ht_command_argv);
                 }
             } else {
@@ -771,7 +785,14 @@ PHP_METHOD(redis_coro, execute_multi)
                 int command_argc = zend_hash_num_elements(ht_command_argv);
                 commands_argv[i+1]=new char*[command_argc];
                 for (int j = 0; j < command_argc; j++) {
-                    commands_argv[i+1][j] = Z_STRVAL_P(zend_hash_get_current_data(ht_command_argv));
+                    zval *z_argv_item = zend_hash_get_current_data(ht_command_argv);
+                    if (Z_TYPE_P(z_argv_item) == IS_STRING) {
+                        commands_argv[i+1][j] = Z_STRVAL_P(z_argv_item);
+                    } else {
+                        char ch_int[32];
+                        itoa(ch_int, Z_LVAL_P(z_argv_item));
+                        commands_argv[i+1][j] = ch_int;
+                    }
                     zend_hash_move_forward(ht_command_argv);
                 }
             } else {
